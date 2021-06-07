@@ -873,12 +873,6 @@ func TestFailureRequestCache(t *testing.T) {
 		}
 
 		cache.RecordFailure(peer, chunk)
-		if !cache.Useful(peer, chunk) {
-			t.Fatal("incorrect cache state after 2nd failure")
-		}
-
-		cache.RecordFailure(peer, chunk)
-
 		if cache.Useful(peer, chunk) {
 			t.Fatal("peer should no longer be useful")
 		}
