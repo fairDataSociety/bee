@@ -7,6 +7,7 @@ package kademlia
 import (
 	"context"
 	random "crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,7 +44,7 @@ var (
 	saturationPeers             = 8
 	overSaturationPeers         = 20
 	bootNodeOverSaturationPeers = 20
-	shortRetry                  = 30 * time.Second
+	shortRetry                  = 2 * time.Second
 	timeToRetry                 = 2 * shortRetry
 	broadcastBinSize            = 4
 )
@@ -96,6 +97,7 @@ type Kad struct {
 	wg                sync.WaitGroup
 	waitNext          *waitnext.WaitNext
 	metrics           metrics
+	sqlDB             *sql.DB
 }
 
 // New returns a new Kademlia.
@@ -104,6 +106,7 @@ func New(
 	addressbook addressbook.Interface,
 	discovery discovery.Driver,
 	p2p p2p.Service,
+	sqlDB *sql.DB,
 	metricsDB *shed.DB,
 	logger logging.Logger,
 	o Options,
@@ -141,6 +144,7 @@ func New(
 		done:              make(chan struct{}),
 		wg:                sync.WaitGroup{},
 		metrics:           newMetrics(),
+		sqlDB:             sqlDB,
 	}
 
 	if k.bitSuffixLength > 0 {
@@ -305,76 +309,92 @@ func (k *Kad) connectNeighbours(wg *sync.WaitGroup, peerConnChan, peerConnChan2 
 	const multiplePeerThreshold = 8
 
 	sent := 0
+	guardC := make(chan struct{}, 100)
 	_ = k.knownPeers.EachBinRev(func(addr swarm.Address, po uint8) (bool, bool, error) {
-		depth := k.NeighborhoodDepth()
+		guardC <- struct{}{}
+		go func() {
+			defer func() {
+				<-guardC
+			}()
+			depth := k.NeighborhoodDepth()
 
-		if depth > po || po >= depth+multiplePeerThreshold {
-			return false, true, nil
-		}
-
-		if len(k.connectedPeers.BinPeers(po)) >= overSaturationPeers-1 {
-			return false, true, nil
-		}
-
-		if k.connectedPeers.Exists(addr) {
-			return false, false, nil
-		}
-
-		if k.waitNext.Waiting(addr) {
-			k.metrics.TotalBeforeExpireWaits.Inc()
-			return false, false, nil
-		}
-
-		select {
-		case <-k.quit:
-			return true, false, nil
-		default:
-			wg.Add(1)
-			peerConnChan <- &peerConnInfo{
-				po:   po,
-				addr: addr,
+			if depth > po || po >= depth+multiplePeerThreshold {
+				return
 			}
-			sent++
-		}
 
-		// We want to sent number of attempts equal to saturationPeers
-		// in order to speed up the topology build.
-		next := sent == saturationPeers
-		if next {
-			sent = 0
-		}
-		return false, next, nil
+			if len(k.connectedPeers.BinPeers(po)) >= overSaturationPeers-1 {
+				return
+			}
+
+			if k.connectedPeers.Exists(addr) {
+				return
+			}
+
+			if k.waitNext.Waiting(addr) {
+				k.metrics.TotalBeforeExpireWaits.Inc()
+				return
+			}
+
+			select {
+			case <-k.quit:
+				return
+			default:
+				wg.Add(1)
+				peerConnChan <- &peerConnInfo{
+					po:   po,
+					addr: addr,
+				}
+				sent++
+			}
+
+			// We want to sent number of attempts equal to saturationPeers
+			// in order to speed up the topology build.
+			next := sent == saturationPeers
+			if next {
+				sent = 0
+			}
+			return
+		}()
+		return false, true, nil
 	})
 
+	guard2C := make(chan struct{}, 100)
 	_ = k.knownPeers.EachBinRev(func(addr swarm.Address, po uint8) (bool, bool, error) {
-		depth := k.NeighborhoodDepth()
+		guard2C <- struct{}{}
+		go func() {
+			defer func() {
+				<-guard2C
+			}()
+			depth := k.NeighborhoodDepth()
 
-		if po < depth+multiplePeerThreshold {
-			return false, true, nil
-		}
-
-		if k.connectedPeers.Exists(addr) {
-			return false, false, nil
-		}
-
-		if k.waitNext.Waiting(addr) {
-			k.metrics.TotalBeforeExpireWaits.Inc()
-			return false, false, nil
-		}
-
-		select {
-		case <-k.quit:
-			return true, false, nil
-		default:
-			wg.Add(1)
-			peerConnChan2 <- &peerConnInfo{
-				po:   po,
-				addr: addr,
+			if po < depth+multiplePeerThreshold {
+				return
 			}
-		}
 
-		// The bin could be saturated or not, so a decision cannot
-		// be made before checking the next peer, so we iterate to next.
+			if k.connectedPeers.Exists(addr) {
+				return
+			}
+
+			if k.waitNext.Waiting(addr) {
+				k.metrics.TotalBeforeExpireWaits.Inc()
+				return
+			}
+
+			select {
+			case <-k.quit:
+				return
+			default:
+				wg.Add(1)
+				peerConnChan2 <- &peerConnInfo{
+					po:   po,
+					addr: addr,
+				}
+			}
+
+			// The bin could be saturated or not, so a decision cannot
+			// be made before checking the next peer, so we iterate to next.
+			return
+		}()
 		return false, true, nil
 	})
 }
@@ -424,13 +444,13 @@ func (k *Kad) connectionAttemptsHandler(ctx context.Context, wg *sync.WaitGroup,
 		k.metrics.TotalOutboundConnections.Inc()
 		k.collector.Record(peer.addr, im.PeerLogIn(time.Now(), im.PeerConnectionDirectionOutbound))
 
-		k.depthMu.Lock()
-		k.depth = recalcDepth(k.connectedPeers, k.radius)
-		k.depthMu.Unlock()
+		//k.depthMu.Lock()
+		//k.depth = recalcDepth(k.connectedPeers, k.radius)
+		//k.depthMu.Unlock()
 
 		k.logger.Debugf("kademlia: connected to peer: %q in bin: %d", peer.addr, peer.po)
 		k.notifyManageLoop()
-		k.notifyPeerSig()
+		//k.notifyPeerSig()
 	}
 
 	var (
@@ -506,7 +526,7 @@ func (k *Kad) manage() {
 		select {
 		case <-k.quit:
 			return
-		case <-time.After(30 * time.Second):
+		case <-time.After(1 * time.Second):
 			start := time.Now()
 			if err := k.collector.Flush(); err != nil {
 				k.metrics.InternalMetricsFlushTotalErrors.Inc()
@@ -751,6 +771,32 @@ func (k *Kad) connect(ctx context.Context, peer swarm.Address, ma ma.Multiaddr) 
 		} else {
 			failedAttempts = k.waitNext.Attempts(peer)
 			failedAttempts++
+			tx, err := k.sqlDB.Begin()
+			if err != nil {
+				return err
+			}
+
+			updateStatement := `update PEER_INFO set RETRY_COUNT = RETRY_COUNT + 1 WHERE OVERLAY = ?`
+			statement1, err := tx.Prepare(updateStatement)
+			if err != nil {
+				tx.Rollback()
+				k.logger.Errorf("connectAttempt: %v", err)
+				return err
+			}
+			defer statement1.Close()
+			_, err = statement1.Exec(peer.String())
+			if err != nil {
+				tx.Rollback()
+				k.logger.Errorf("connectAttempt: %v", err)
+				return err
+			}
+
+			err = tx.Commit()
+			if err != nil {
+				tx.Rollback()
+				k.logger.Errorf("connectAttempt: %v", err)
+				return err
+			}
 		}
 
 		k.metrics.TotalOutboundConnectionFailedAttempts.Inc()
@@ -883,12 +929,12 @@ func (k *Kad) connected(ctx context.Context, addr swarm.Address) error {
 
 	k.waitNext.Remove(addr)
 
-	k.depthMu.Lock()
-	k.depth = recalcDepth(k.connectedPeers, k.radius)
-	k.depthMu.Unlock()
+	//k.depthMu.Lock()
+	//k.depth = recalcDepth(k.connectedPeers, k.radius)
+	//k.depthMu.Unlock()
 
 	k.notifyManageLoop()
-	k.notifyPeerSig()
+	//k.notifyPeerSig()
 	return nil
 
 }
@@ -905,12 +951,12 @@ func (k *Kad) Disconnected(peer p2p.Peer) {
 	k.metrics.TotalInboundDisconnections.Inc()
 	k.collector.Record(peer.Address, im.PeerLogOut(time.Now()))
 
-	k.depthMu.Lock()
-	k.depth = recalcDepth(k.connectedPeers, k.radius)
-	k.depthMu.Unlock()
+	//k.depthMu.Lock()
+	//k.depth = recalcDepth(k.connectedPeers, k.radius)
+	//k.depthMu.Unlock()
 
 	k.notifyManageLoop()
-	k.notifyPeerSig()
+	//k.notifyPeerSig()
 }
 
 func (k *Kad) notifyPeerSig() {

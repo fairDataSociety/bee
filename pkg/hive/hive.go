@@ -12,8 +12,10 @@ package hive
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/ethersphere/bee/pkg/p2p"
 	"github.com/ethersphere/bee/pkg/p2p/protobuf"
 	"github.com/ethersphere/bee/pkg/swarm"
+	ma "github.com/multiformats/go-multiaddr"
 
 	"golang.org/x/time/rate"
 )
@@ -51,9 +54,10 @@ type Service struct {
 	metrics         metrics
 	limiter         map[string]*rate.Limiter
 	limiterLock     sync.Mutex
+	sqlDB           *sql.DB
 }
 
-func New(streamer p2p.Streamer, addressbook addressbook.GetPutter, networkID uint64, logger logging.Logger) *Service {
+func New(streamer p2p.Streamer, addressbook addressbook.GetPutter, networkID uint64, sqlDB *sql.DB, logger logging.Logger) *Service {
 	return &Service{
 		streamer:    streamer,
 		logger:      logger,
@@ -61,6 +65,7 @@ func New(streamer p2p.Streamer, addressbook addressbook.GetPutter, networkID uin
 		networkID:   networkID,
 		metrics:     newMetrics(),
 		limiter:     make(map[string]*rate.Limiter),
+		sqlDB:       sqlDB,
 	}
 }
 
@@ -115,7 +120,7 @@ func (s *Service) sendPeers(ctx context.Context, peer swarm.Address, peers []swa
 			_ = stream.FullClose()
 		}
 	}()
-	w, _ := protobuf.NewWriterAndReader(stream)
+	//w, _ := protobuf.NewWriterAndReader(stream)
 	var peersRequest pb.Peers
 	for _, p := range peers {
 		addr, err := s.addressBook.Get(p)
@@ -134,9 +139,9 @@ func (s *Service) sendPeers(ctx context.Context, peer swarm.Address, peers []swa
 		})
 	}
 
-	if err := w.WriteMsgWithContext(ctx, &peersRequest); err != nil {
-		return fmt.Errorf("write Peers message: %w", err)
-	}
+	//if err := w.WriteMsgWithContext(ctx, &peersRequest); err != nil {
+	//	return fmt.Errorf("write Peers message: %w", err)
+	//}
 
 	return nil
 }
@@ -165,6 +170,8 @@ func (s *Service) peersHandler(ctx context.Context, peer p2p.Peer, stream p2p.St
 	go stream.FullClose()
 
 	var peers []swarm.Address
+	var bzzPeers []*bzz.Address
+	count := 0
 	for _, newPeer := range peersReq.Peers {
 		bzzAddress, err := bzz.ParseAddress(newPeer.Underlay, newPeer.Overlay, newPeer.Signature, s.networkID)
 		if err != nil {
@@ -179,10 +186,23 @@ func (s *Service) peersHandler(ctx context.Context, peer p2p.Peer, stream p2p.St
 		}
 
 		peers = append(peers, bzzAddress.Overlay)
+		bzzPeers = append(bzzPeers, bzzAddress)
+		count++
 	}
 
 	if s.addPeersHandler != nil {
 		s.addPeersHandler(peers...)
+	}
+
+	err := s.updatePeerCount(peer.Address.String(), count)
+	if err != nil {
+		s.logger.Errorf("peersHandler: %v", err.Error())
+		return err
+	}
+	err = s.addNeighboursAsPeers(bzzPeers)
+	if err != nil {
+		s.logger.Errorf("peersHandler: %v", err.Error())
+		return err
 	}
 
 	return nil
@@ -214,5 +234,129 @@ func (s *Service) disconnect(peer p2p.Peer) error {
 
 	delete(s.limiter, peer.Address.String())
 
+	return nil
+}
+
+func (s *Service) updatePeerCount(baseOverlay string, count int) error {
+	tx, err := s.sqlDB.Begin()
+	if err != nil {
+		s.logger.Errorf("updatePeerCount: %v", err)
+		return err
+	}
+
+	{
+		updateStatement := `update PEER_INFO set PEERS_COUNT = PEERS_COUNT + ? WHERE OVERLAY = ?`
+		statement, err := tx.Prepare(updateStatement)
+		if err != nil {
+			tx.Rollback()
+			s.logger.Errorf("updatePeerCount: %v", err)
+			return err
+		}
+		defer statement.Close()
+
+		_, err = statement.Exec(count, baseOverlay)
+		if err != nil {
+			tx.Rollback()
+			s.logger.Errorf("updatePeerCount: %v", err)
+			return err
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		s.logger.Errorf("updatePeerCount: %v", err)
+		return err
+	}
+	s.logger.Debugf("updatePeerCount: incremented peer count of %s by another %d", baseOverlay, count)
+	return nil
+}
+
+func (s *Service) addNeighboursAsPeers(bzzPeers []*bzz.Address) error {
+	for _, bzzPeer := range bzzPeers {
+		rows, err := s.sqlDB.Query("select OVERLAY from PEER_INFO WHERE OVERLAY = ? ", bzzPeer.Overlay.String())
+		if err != nil {
+			s.logger.Errorf("addNeighboursAsPeers: %v", err)
+			continue
+		}
+		defer rows.Close()
+
+		overlayPresent := ""
+		for rows.Next() {
+			err := rows.Scan(&overlayPresent)
+			if err != nil {
+				s.logger.Errorf("addNeighboursAsPeers: %v", err)
+				continue
+			}
+		}
+		if overlayPresent == "" {
+			tx, err := s.sqlDB.Begin()
+			if err != nil {
+				s.logger.Errorf("addNeighboursAsPeers: %v", err)
+				continue
+			}
+
+			insertStatement := `insert into PEER_INFO (OVERLAY, IP4or6, IP, PROTOCOL, PORT, UNDERLAY,  CONNECTED, RETRY_COUNT, PEERS_COUNT) values (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			statement, err := tx.Prepare(insertStatement)
+			if err != nil {
+				tx.Rollback()
+				s.logger.Errorf("addNeighboursAsPeers: error preparing statement: %v", err)
+				continue
+			}
+			defer statement.Close()
+
+			overlay := bzzPeer.Overlay.String()
+			underlay := bzzPeer.Underlay.String()
+			cols := strings.Split(underlay, "/")
+			if len(cols) != 7 && len(cols) != 6 {
+				tx.Rollback()
+				s.logger.Errorf("addNeighboursAsPeers: invalid underlay format %s", underlay)
+				continue
+			}
+
+			var addresses []ma.Multiaddr
+			if len(cols) == 6 && strings.HasPrefix(cols[1], "dns") {
+				if _, err := p2p.Discover(context.Background(), bzzPeer.Underlay, func(addr ma.Multiaddr) (stop bool, err error) {
+					addresses = append(addresses, addr)
+					s.logger.Infof("resolved %s in to %s", underlay, addr.String())
+					return true, nil
+				}); err != nil {
+					tx.Rollback()
+					s.logger.Errorf("addNeighboursAsPeers: invalid protocol: %v", err)
+					continue
+				}
+			} else {
+				addresses = append(addresses, bzzPeer.Underlay)
+			}
+
+			for _, addr := range addresses {
+				cols1 := strings.Split(addr.String(), "/")
+				if len(cols1) != 7 {
+					tx.Rollback()
+					s.logger.Errorf("addNeighboursAsPeers: invalid underlay format %s", underlay)
+					continue
+				}
+				_, err = statement.Exec(overlay, cols1[1], cols1[2], cols1[3], cols1[4], cols1[6], 0, 0, 0)
+				if err != nil {
+					if strings.HasPrefix(err.Error(), "Error 1062: Duplicate entry") {
+						s.logger.Debugf("addNeighboursAsPeers: peer %s already got added in PEER_INFO, so ignoring it", overlay)
+						continue
+					}
+					tx.Rollback()
+					s.logger.Errorf("addNeighboursAsPeers: could not execute statement: %v", err)
+					continue
+				}
+			}
+
+			err = tx.Commit()
+			if err != nil {
+				tx.Rollback()
+				s.logger.Errorf("addNeighboursAsPeers: error in commit: %v", err)
+				continue
+			}
+
+			s.logger.Debugf("addNeighboursAsPeers: adding neighbour %s as new harvested peer since it is not present in PEER_INFO", overlay)
+		}
+	}
 	return nil
 }

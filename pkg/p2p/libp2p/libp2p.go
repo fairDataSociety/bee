@@ -7,9 +7,11 @@ package libp2p
 import (
 	"context"
 	"crypto/ecdsa"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,6 +75,7 @@ type Service struct {
 	lightNodes        lightnodes
 	lightNodeLimit    int
 	protocolsmu       sync.RWMutex
+	sqlDB             *sql.DB
 }
 
 type lightnodes interface {
@@ -92,6 +95,7 @@ type Options struct {
 	LightNodeLimit int
 	WelcomeMessage string
 	Transaction    []byte
+	SqlDB          *sql.DB
 }
 
 func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay swarm.Address, addr string, ab addressbook.Putter, storer storage.StateStorer, lightNodes *lightnode.Container, swapBackend handshake.SenderMatcher, logger logging.Logger, tracer *tracing.Tracer, o Options) (*Service, error) {
@@ -242,6 +246,7 @@ func New(ctx context.Context, signer beecrypto.Signer, networkID uint64, overlay
 		ready:             make(chan struct{}),
 		halt:              make(chan struct{}),
 		lightNodes:        lightNodes,
+		sqlDB:             o.SqlDB,
 	}
 
 	peerRegistry.setDisconnecter(s)
@@ -364,9 +369,9 @@ func (s *Service) handleIncoming(stream network.Stream) {
 		if !i.FullNode {
 			s.lightNodes.Connected(s.ctx, peer)
 			//light node announces explicitly
-			if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
-				s.logger.Debugf("stream handler: notifier.Announce: %s: %v", peer.Address.String(), err)
-			}
+			//if err := s.notifier.Announce(s.ctx, peer.Address, i.FullNode); err != nil {
+			//	s.logger.Debugf("stream handler: notifier.Announce: %s: %v", peer.Address.String(), err)
+			//}
 
 			if s.lightNodes.Count() > s.lightNodeLimit {
 				// kick another node to fit this one in
@@ -654,6 +659,12 @@ func (s *Service) Connect(ctx context.Context, addr ma.Multiaddr) (address *bzz.
 		return nil, fmt.Errorf("libp2p connect: peer %s does not exist %w", overlay, p2p.ErrPeerNotFound)
 	}
 
+	err = s.addConnectedPeerToDB(i.BzzAddress, "outbound)")
+	if err != nil {
+		s.logger.Errorf("connect: %v (outbound)", err.Error())
+		return nil, err
+	}
+
 	s.metrics.CreatedConnectionCount.Inc()
 
 	s.logger.Debugf("successfully connected to peer %s%s (outbound)", i.BzzAddress.ShortString(), i.LightString())
@@ -693,6 +704,12 @@ func (s *Service) Disconnect(overlay swarm.Address) error {
 	if !found {
 		s.logger.Debugf("libp2p disconnect: peer %s not found", overlay)
 		return p2p.ErrPeerNotFound
+	}
+
+	err := s.removePeerFromDB(overlay)
+	if err != nil {
+		s.logger.Errorf("DISCONNECT: %v", err.Error())
+		return err
 	}
 
 	return nil
@@ -816,4 +833,160 @@ func (s *Service) Ready() {
 
 func (s *Service) Halt() {
 	close(s.halt)
+}
+
+func (s *Service) addConnectedPeerToDB(bzzAddress *bzz.Address, bound string) error {
+	// check if the overlay is already present in PEER_INFO
+	rows, err := s.sqlDB.Query("select OVERLAY from PEER_INFO WHERE OVERLAY = ?", bzzAddress.Overlay.String())
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	overlayPresent := ""
+	for rows.Next() {
+		err := rows.Scan(&overlayPresent)
+		if err != nil {
+			s.logger.Errorf("addConnectedPeerToDB: %v", err)
+			return err
+		}
+	}
+
+	tx, err := s.sqlDB.Begin()
+	if err != nil {
+		s.logger.Errorf("addConnectedPeerToDB: %v", err)
+		return err
+	}
+
+	if overlayPresent == "" {
+		// it is not present, so insert the connected peer in to DB
+		insertStatement := `insert into PEER_INFO (OVERLAY, IP4or6, IP, PROTOCOL, PORT, UNDERLAY, CONNECTED, RETRY_COUNT, PEERS_COUNT) values (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		statement, err := tx.Prepare(insertStatement)
+		if err != nil {
+			tx.Rollback()
+			s.logger.Errorf("addConnectedPeerToDB: %v", err)
+			return err
+		}
+		defer statement.Close()
+
+		overlay := bzzAddress.Overlay.String()
+		underlay := bzzAddress.Underlay.String()
+		cols := strings.Split(underlay, "/")
+		if len(cols) != 7 && len(cols) != 6 {
+			tx.Rollback()
+			s.logger.Errorf("addConnectedPeerToDB: invalid underlay format %s (%s)", underlay, bound)
+			return fmt.Errorf("invalid underlay format %s (%s)", underlay, bound)
+		}
+
+		var addresses []ma.Multiaddr
+		if len(cols) == 6 && strings.HasPrefix(cols[1], "dns") {
+			if _, err := p2p.Discover(context.Background(), bzzAddress.Underlay, func(addr ma.Multiaddr) (stop bool, err error) {
+				addresses = append(addresses, addr)
+				s.logger.Infof("resolved %s in to %s", underlay, addr.String())
+				return true, nil
+			}); err != nil {
+				tx.Rollback()
+				s.logger.Errorf("addConnectedPeerToDB: %v", err)
+				return err
+			}
+		} else {
+			addresses = append(addresses, bzzAddress.Underlay)
+		}
+
+		for _, addr := range addresses {
+			cols1 := strings.Split(addr.String(), "/")
+			if len(cols1) != 7 {
+				return fmt.Errorf("invalid underlay format %s (%s)", underlay, bound)
+			}
+			_, err = statement.Exec(overlay, cols1[1], cols1[2], cols1[3], cols1[4], cols1[6], 1, 0, 0)
+			if err != nil {
+				if strings.HasPrefix(err.Error(), "UNIQUE") {
+					// Someone has inserted the PEER before we can insert... so just make it as connected
+					updateStatement := `update PEER_INFO set CONNECTED = 1 , RETRY_COUNT = 0, PEERS_COUNT = 0 WHERE OVERLAY = ?`
+					statement1, err := tx.Prepare(updateStatement)
+					if err != nil {
+						tx.Rollback()
+						s.logger.Errorf("addConnectedPeerToDB: %v", err)
+						return err
+					}
+					defer statement1.Close()
+
+					_, err = statement1.Exec(overlay)
+					if err != nil {
+						tx.Rollback()
+						s.logger.Errorf("addConnectedPeerToDB: %v", err)
+						return err
+					}
+					s.logger.Infof("addConnectedPeerToDB: peer %s already present in PEER_INFO, so marking as connected (%s)", overlay, bound)
+					return nil
+				} else {
+					tx.Rollback()
+					s.logger.Errorf("addConnectedPeerToDB: %v", err)
+					return err
+				}
+			}
+		}
+		s.logger.Infof("addConnectedPeerToDB: inserted %s in to PEER_INFO (%s)", overlay, bound)
+	} else {
+		// it is present, just update the peer count to 0
+		updateStatement := `update PEER_INFO set CONNECTED = 1, RETRY_COUNT = 0, PEERS_COUNT = 0 WHERE OVERLAY = ?`
+		statement2, err := tx.Prepare(updateStatement)
+		if err != nil {
+			tx.Rollback()
+			s.logger.Errorf("addConnectedPeerToDB: %v", err)
+			return err
+		}
+		defer statement2.Close()
+
+		overlay := bzzAddress.Overlay.String()
+		_, err = statement2.Exec(overlay)
+		if err != nil {
+			tx.Rollback()
+			s.logger.Errorf("addConnectedPeerToDB: %v", err)
+			return err
+		}
+		s.logger.Infof("addConnectedPeerToDB: making %s as connected in peer info (%s)", overlay, bound)
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		s.logger.Errorf("addConnectedPeerToDB: %v", err)
+		return err
+	}
+	return nil
+}
+
+func (s *Service) removePeerFromDB(overlayToDelete swarm.Address) error {
+
+	tx, err := s.sqlDB.Begin()
+	if err != nil {
+		s.logger.Errorf("removePeerFromDB: %v", err)
+		return err
+	}
+
+	// mark the peer as disconnected
+	updateStatement := `update PEER_INFO set CONNECTED = 0 , RETRY_COUNT = 0, PEERS_COUNT = 0 WHERE OVERLAY = ?`
+	statement1, err := tx.Prepare(updateStatement)
+	if err != nil {
+		tx.Rollback()
+		s.logger.Errorf("removePeerFromDB: %v", err)
+		return err
+	}
+	defer statement1.Close()
+
+	_, err = statement1.Exec(overlayToDelete.String())
+	if err != nil {
+		tx.Rollback()
+		s.logger.Errorf("removePeerFromDB: %v", err)
+		return err
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		tx.Rollback()
+		s.logger.Errorf("removePeerFromDB: %v", err)
+		return err
+	}
+
+	return nil
 }
